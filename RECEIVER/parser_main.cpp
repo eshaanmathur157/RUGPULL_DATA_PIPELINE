@@ -1,3 +1,5 @@
+// parser_main.cpp
+
 // C++ Standard Library
 #include <iostream>
 #include <string_view>
@@ -9,11 +11,13 @@
 #include <chrono>
 #include <atomic>
 #include <exception>
+
 // Linux/POSIX Shared Memory Headers
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
 // Your Parser Project Headers
 #include "common.h"
 #include "file_utils.h"
@@ -26,6 +30,7 @@
 // On Linux, this usually maps to /dev/shm/solana_json_shm
 const char* SHM_NAME = "solana_json_shm";
 const size_t SHM_SIZE = 10 * 1024 * 1024; // 10MB
+
 // Offsets matches your Python script
 const size_t FLAG_OFFSET = 0;
 const size_t SIZE_OFFSET = 1;
@@ -42,11 +47,11 @@ int main(int argc, char *argv[]) {
         std::cerr << "Usage: " << argv[0] << " <base_quotes_file>" << std::endl;
         return 1;
     }
-   
+
     std::cout << "Loading hot addresses from: " << argv[1] << std::endl;
     HotAddressLookups hot_addresses = load_hot_addresses(argv[1]);
     std::cout << "Loaded hot addresses." << std::endl;
-    
+
     // --- 2. Connect to Shared Memory ---
     int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
     if (shm_fd == -1) {
@@ -62,27 +67,28 @@ int main(int argc, char *argv[]) {
     }
     close(shm_fd); // FD not needed after mapping
     std::cout << "Consumer: Attached to shared memory. Polling..." << std::endl;
-    
+
     // --- 3. Pointers to Offsets ---
     // Flag is at offset 0
     volatile uint8_t* flag_ptr = reinterpret_cast<volatile uint8_t*>(pBuf + FLAG_OFFSET);
-   
+
     // Data starts at offset 9
     char* data_start_ptr = pBuf + DATA_OFFSET;
-    
+
     // --- 4. Main Loop ---
     try {
         while (true) {
             // Python writes 1 when data is ready. We wait for 1.
             if (*flag_ptr == 1) {
-               
+
                 auto job_start_time = std::chrono::high_resolution_clock::now();
+                
                 // --- READ SIZE SAFELY ---
                 // Because offset 1 is not 8-byte aligned, we use memcpy to avoid
                 // strict-aliasing violations or bus errors.
                 uint64_t json_size = 0;
                 std::memcpy(&json_size, pBuf + SIZE_OFFSET, 8); // Read 8 bytes from offset 1
-                
+
                 // Safety Check
                 if (json_size > (SHM_SIZE - DATA_OFFSET)) {
                     std::cerr << "Error: Size in SHM (" << json_size << ") exceeds buffer limit." << std::endl;
@@ -90,48 +96,46 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 std::cout << "\n>>> New Data Detected! Size: " << json_size << " bytes" << std::endl;
-                
+
                 // --- PROCESS ONLY THE JSON PART ---
                 // We pass the pointer to offset 9 and the specific size we read
-               
-                // 1. Extract Timestamp (Optional, dependent on your logic)
+
+                // 1. Extract Timestamp
+                // This gets the actual blockTime from the JSON (e.g., 1766831972)
                 std::string block_time_str = extract_block_time(std::string_view(data_start_ptr, json_size));
-                
+
                 // 2. Stage 1: SIMD Indexing
                 std::vector<uint64_t> index_list;
                 // Reserve approximate size (average token is ~14 chars)
                 index_list.resize((json_size / 14) + 256);
                 size_t actual_indices = process_json_in_batches(data_start_ptr, json_size, index_list.data());
                 index_list.resize(actual_indices);
-               
+
                 // 3. Stage 2: Build SkipMap
                 SkipMapBuilder skip_map_builder(index_list, data_start_ptr);
-               
+
                 // 4. Stage 2: Find Transactions
                 auto transaction_views = find_transaction_views(index_list, skip_map_builder.getSkipMap(), data_start_ptr);
-                
+
                 // 5. Stage 2: Parallel Parse AND Send to Flight
                 std::atomic<size_t> pool_tx_counter(0);
-                // Generate current time string for metadata
-                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count();
- 
-                // NOTE: This function now returns void because data is streamed out
+
+                // FIXED: Passing 'block_time_str' extracted from JSON instead of current system time
                 process_transactions_parallel(
                     transaction_views,
                     hot_addresses,
-                    std::to_string(now_ms),
+                    block_time_str,      // <--- Corrected here
                     FLIGHT_SERVER_URI,
                     pool_tx_counter
                 );
-               
+
                 // Optional: Print summary
                 std::cout << "Parsed and Sent " << pool_tx_counter.load() << " target transactions." << std::endl;
-                
+
                 auto job_end_time = std::chrono::high_resolution_clock::now();
                 std::chrono::duration<double, std::milli> elapsed = job_end_time - job_start_time;
                 std::cout << "Done in " << elapsed.count() << " ms." << std::endl;
-                
+
                 // --- SIGNAL COMPLETION ---
                 // Set flag back to 0 so Python knows we are done
                 *flag_ptr = 0;

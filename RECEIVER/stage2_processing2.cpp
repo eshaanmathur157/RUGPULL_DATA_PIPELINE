@@ -12,6 +12,7 @@ SkipMapBuilder::SkipMapBuilder(const std::vector<uint64_t>& list, const char* js
     std::cout << "Building skip-map (on small index)..." << std::endl;
     buildSkipMap();
 }
+
 void SkipMapBuilder::buildSkipMap() {
     m_skipMap.resize(m_list.size(), 0);
     std::stack<size_t> stack;
@@ -28,6 +29,7 @@ void SkipMapBuilder::buildSkipMap() {
         }
     }
 }
+
 const std::vector<size_t>& SkipMapBuilder::getSkipMap() const {
     return m_skipMap;
 }
@@ -260,11 +262,11 @@ std::shared_ptr<arrow::Schema> GetOutputSchema() {
     });
 }
 
-// --- HELPER: Flush Builders to Flight (WITH EMBEDDED METADATA) ---
+// --- HELPER: Flush Builders to Flight (Sends Block Time in Metadata) ---
 arrow::Status FlushBuildersToFlight(
     ThreadLocalBuilders& builders,
     arrow::flight::FlightStreamWriter* writer,
-    const std::string& timestamp_str // <--- 1. Receive the timestamp
+    const std::string& block_time_str // <--- Renamed for clarity
 ) {
     std::shared_ptr<arrow::Array> wallet_arr;
     std::shared_ptr<arrow::Array> sig_arr;
@@ -278,26 +280,24 @@ arrow::Status FlushBuildersToFlight(
     ARROW_RETURN_NOT_OK(builders.pre_balance_builder.Finish(&pre_arr));
     ARROW_RETURN_NOT_OK(builders.post_balance_builder.Finish(&post_arr));
 
-    // --- 2. Create Schema with Metadata ---
+    // 1. Get Schema
     auto base_schema = GetOutputSchema();
-    
-    // Create the key-value pair
-    auto kv_metadata = std::make_shared<arrow::KeyValueMetadata>();
-    kv_metadata->Append("timestamp", timestamp_str);
 
-    // Attach it to the schema (THIS IS THE TRICK)
-    auto schema_with_metadata = base_schema->WithMetadata(kv_metadata);
-
-    // --- 3. Create Batch using the Modified Schema ---
+    // 2. Create Batch
     auto batch = arrow::RecordBatch::Make(
-        schema_with_metadata, 
+        base_schema,
         wallet_arr->length(),
         {wallet_arr, sig_arr, mint_arr, pre_arr, post_arr}
     );
 
     if (batch->num_rows() > 0) {
-        // --- 4. Send Standard Batch (Metadata travels inside) ---
-        ARROW_RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
+        // 3. Create Metadata Buffer with Block Time
+        // Key is still "timestamp" so Python picks it up automatically
+        std::string meta_payload = "timestamp:" + block_time_str;
+        std::shared_ptr<arrow::Buffer> meta_buffer = arrow::Buffer::FromString(meta_payload);
+        
+        // 4. Send Batch WITH Metadata
+        ARROW_RETURN_NOT_OK(writer->WriteWithMetadata(*batch, meta_buffer));
     }
     return arrow::Status::OK();
 }
@@ -306,7 +306,7 @@ arrow::Status FlushBuildersToFlight(
 void process_transactions_parallel(
     const std::vector<TxKeyViews>& transaction_views,
     const HotAddressLookups& hot_addresses,
-    const std::string& global_start_time_str,
+    const std::string& block_time_str, // <--- Renamed: Pass your found blockTime here
     const std::string& flight_server_uri,
     std::atomic<size_t>& pool_tx_counter
 ) {
@@ -368,7 +368,7 @@ void process_transactions_parallel(
 
             index_to_hot_addr_map.clear();
             int current_index = 0;
-            
+
             parse_string_array(tx_views.accountKeys_view, address_strings);
             for (const auto& addr : address_strings) {
                 const uint64_t hash = XXH3_64bits_withSeed(addr.data(), addr.length(), 0);
@@ -392,7 +392,8 @@ void process_transactions_parallel(
             parse_token_balance_array(tx_views.preTokenBalances_view, tx_map, true, index_to_hot_addr_map);
             parse_token_balance_array(tx_views.postTokenBalances_view, tx_map, false, index_to_hot_addr_map);
 
-            std::string signature = global_start_time_str + "-" + std::to_string(tx_idx) + data_center_index;
+            // Use the block_time_str in the signature generation
+            std::string signature = block_time_str + "-" + std::to_string(tx_idx) + data_center_index;
             for (const auto& owner_pair : tx_map) {
                 const std::string_view& owner_wallet = owner_pair.first;
                 for (const auto& mint_pair : owner_pair.second) {
@@ -406,8 +407,8 @@ void process_transactions_parallel(
             }
 
             if (builders.tx_wallet_builder.length() >= BATCH_SIZE_THRESHOLD) {
-                // Pass the timestamp string here
-                arrow::Status status = FlushBuildersToFlight(builders, writer.get(), global_start_time_str);
+                // Pass block_time_str to Flush
+                arrow::Status status = FlushBuildersToFlight(builders, writer.get(), block_time_str);
                 if (!status.ok()) {
                      std::cerr << "Thread " << thread_id << " Write Error: " << status.ToString() << std::endl;
                      break;
@@ -416,8 +417,8 @@ void process_transactions_parallel(
         }
 
         if (builders.tx_wallet_builder.length() > 0) {
-             // Pass the timestamp string here
-             arrow::Status status = FlushBuildersToFlight(builders, writer.get(), global_start_time_str);
+             // Pass block_time_str to Final Flush
+             arrow::Status status = FlushBuildersToFlight(builders, writer.get(), block_time_str);
              if (!status.ok()) {
                  std::cerr << "Thread " << thread_id << " Final Flush Error: " << status.ToString() << std::endl;
              }
